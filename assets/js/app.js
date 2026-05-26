@@ -206,36 +206,193 @@
         els.tgtLang.value = s;
     });
 
-    // ---------- PDF text extraction ----------
+    // ---------- PDF text extraction (column-aware for academic papers) ----------
+
+    // Smart line joiner: if x-gap between items is small, no extra space (word continuation)
+    function joinLineItems(lineItems) {
+        lineItems.sort(function (a, b) { return a.x - b.x; });
+        var out = "";
+        for (var i = 0; i < lineItems.length; i++) {
+            var it = lineItems[i];
+            if (i === 0) { out += it.str; continue; }
+            var prev = lineItems[i - 1];
+            var prevEnd = prev.x + (prev.width || 0);
+            var gap = it.x - prevEnd;
+            var charW = (prev.height || 10) * 0.3;
+            // If previous already ends with whitespace OR new starts with whitespace, just concat
+            if (/\s$/.test(out) || /^\s/.test(it.str)) {
+                out += it.str;
+            } else if (gap > charW * 1.3) {
+                out += " " + it.str;
+            } else {
+                out += it.str; // word continuation, no extra space
+            }
+        }
+        return out.replace(/[ \t]+/g, " ").trim();
+    }
+
+    // Group items into raw lines by y-proximity
+    function groupIntoLines(items, yTol) {
+        items.sort(function (a, b) { return b.y - a.y || a.x - b.x; });
+        var lines = [];
+        var curr = [];
+        var currY = null;
+        items.forEach(function (it) {
+            if (currY === null || Math.abs(it.y - currY) <= yTol) {
+                curr.push(it);
+                if (currY === null) currY = it.y;
+            } else {
+                lines.push({ y: currY, items: curr });
+                curr = [it];
+                currY = it.y;
+            }
+        });
+        if (curr.length) lines.push({ y: currY, items: curr });
+        return lines;
+    }
+
+    // Build text from a list of "raw lines" with paragraph-gap detection
+    function linesToText(lines) {
+        var parts = [];
+        var prevY = null;
+        var prevH = null;
+        lines.forEach(function (ln) {
+            var text = joinLineItems(ln.items);
+            if (!text) return;
+            var lineH = ln.items[0].height || 10;
+            if (prevY !== null) {
+                var gap = prevY - ln.y;
+                if (gap > Math.max(lineH, prevH) * 1.6) parts.push(""); // blank line = paragraph break
+            }
+            parts.push(text);
+            prevY = ln.y;
+            prevH = lineH;
+        });
+        return parts.join("\n");
+    }
+
     async function extractPdfText(file) {
         await ensurePdfJs();
         setPdfJsWorker();
         var arrayBuf = await file.arrayBuffer();
         var pdf = await pdfjsLib.getDocument({ data: arrayBuf }).promise;
         var pages = [];
+
         for (var i = 1; i <= pdf.numPages; i++) {
             var page = await pdf.getPage(i);
+            var viewport = page.getViewport({ scale: 1 });
+            var pageWidth = viewport.width;
+            var midX = pageWidth / 2;
             var content = await page.getTextContent();
-            // Re-flow text using y-position to keep lines together
-            var lines = [];
-            var currentY = null;
-            var currentLine = [];
-            content.items.forEach(function (it) {
-                var y = Math.round(it.transform[5]);
-                if (currentY === null || Math.abs(y - currentY) <= 2) {
-                    currentLine.push(it.str);
-                    currentY = currentY === null ? y : currentY;
-                } else {
-                    lines.push(currentLine.join(" ").replace(/\s+/g, " ").trim());
-                    currentLine = [it.str];
-                    currentY = y;
+
+            var items = content.items
+                .filter(function (it) { return it && it.str; })
+                .map(function (it) {
+                    return {
+                        str: it.str,
+                        x: it.transform[4],
+                        y: it.transform[5],
+                        width: it.width || 0,
+                        height: it.height || (it.transform[3] || 10),
+                    };
+                });
+
+            if (items.length === 0) { pages.push(""); continue; }
+
+            // Step 1: build raw lines
+            var rawLines = groupIntoLines(items.slice(), 3);
+
+            // Step 2: classify each line as full-width, left-col, right-col, or split (2 col-lines on same y)
+            var classified = rawLines.map(function (ln) {
+                ln.items.sort(function (a, b) { return a.x - b.x; });
+                var minX = ln.items[0].x;
+                var maxXEnd = ln.items.reduce(function (m, it) {
+                    return Math.max(m, it.x + (it.width || 0));
+                }, 0);
+
+                // Entirely in left half?
+                if (maxXEnd <= midX + 10) return { type: "left", line: ln };
+                // Entirely in right half?
+                if (minX >= midX - 10) return { type: "right", line: ln };
+
+                // Mixed: detect gap around middle to decide split vs full-width
+                var leftItems = ln.items.filter(function (it) { return (it.x + (it.width || 0)) <= midX + 5; });
+                var rightItems = ln.items.filter(function (it) { return it.x >= midX - 5; });
+                var hasGap = leftItems.length > 0 && rightItems.length > 0;
+
+                if (hasGap) {
+                    // Compute the gap size
+                    var leftMaxEnd = Math.max.apply(null, leftItems.map(function (it) { return it.x + (it.width || 0); }));
+                    var rightMinX = Math.min.apply(null, rightItems.map(function (it) { return it.x; }));
+                    var gutter = rightMinX - leftMaxEnd;
+                    if (gutter > 20) {
+                        // Two separate column-lines on same y → split
+                        return {
+                            type: "split",
+                            leftLine: { y: ln.y, items: leftItems },
+                            rightLine: { y: ln.y, items: rightItems },
+                        };
+                    }
                 }
+                // Otherwise full-width line
+                return { type: "full", line: ln };
             });
-            if (currentLine.length) {
-                lines.push(currentLine.join(" ").replace(/\s+/g, " ").trim());
+
+            // Step 3: detect if page is 2-column
+            var twoColLines = classified.filter(function (c) { return c.type === "split" || c.type === "left" || c.type === "right"; }).length;
+            var fullLines = classified.filter(function (c) { return c.type === "full"; }).length;
+            var isTwoCol = twoColLines >= 5 && twoColLines > fullLines * 0.6;
+
+            var pageText;
+
+            if (!isTwoCol) {
+                // Single column: just stitch lines top-to-bottom
+                var allLines = classified.map(function (c) {
+                    if (c.type === "split") {
+                        // shouldn't happen if not 2col, but handle
+                        return { y: c.leftLine.y, items: c.leftLine.items.concat(c.rightLine.items) };
+                    }
+                    return c.line;
+                });
+                pageText = linesToText(allLines);
+            } else {
+                // Two-column: separate "top full-width region" from columnar body
+                // Find first non-full line index
+                var splitIdx = 0;
+                while (splitIdx < classified.length && classified[splitIdx].type === "full") splitIdx++;
+
+                var topLines = classified.slice(0, splitIdx).map(function (c) { return c.line; });
+                var bodyClassified = classified.slice(splitIdx);
+
+                var leftBody = [];
+                var rightBody = [];
+                bodyClassified.forEach(function (c) {
+                    if (c.type === "split") {
+                        leftBody.push(c.leftLine);
+                        rightBody.push(c.rightLine);
+                    } else if (c.type === "left") {
+                        leftBody.push(c.line);
+                    } else if (c.type === "right") {
+                        rightBody.push(c.line);
+                    } else {
+                        // full-width inside body (section heading or footer): put in left col
+                        leftBody.push(c.line);
+                    }
+                });
+
+                var topText = linesToText(topLines);
+                var leftText = linesToText(leftBody);
+                var rightText = linesToText(rightBody);
+
+                pageText = [topText, leftText, rightText].filter(Boolean).join("\n\n");
             }
-            pages.push(lines.filter(Boolean).join("\n"));
+
+            // Cleanup: fix common hyphenation across lines (e.g. "trans-\nlation" → "translation")
+            pageText = pageText.replace(/(\w+)-\n(\w+)/g, "$1$2");
+
+            pages.push(pageText);
         }
+
         return pages;
     }
 
@@ -342,21 +499,43 @@
         var marginPt = 36; // ~0.5"
         var contentW = pageW - marginPt * 2;
 
-        // Off-screen container
+        // Off-screen container with journal-style typography
         var stage = document.createElement("div");
-        stage.style.cssText = "position:fixed;left:-99999px;top:0;width:" + Math.round(contentW * 1.5) + "px;background:#fff;color:#111;padding:0;font-family:'Helvetica Neue',Arial,'Noto Sans','Noto Sans CJK SC','Noto Sans Arabic',sans-serif;font-size:14px;line-height:1.55;";
+        stage.style.cssText = [
+            "position:fixed",
+            "left:-99999px",
+            "top:0",
+            "width:" + Math.round(contentW * 1.5) + "px",
+            "background:#fff",
+            "color:#1a1a1a",
+            "padding:0",
+            "font-family:Georgia,'Times New Roman','Noto Serif','Noto Sans','Noto Sans CJK SC','Noto Sans Arabic',serif",
+            "font-size:14px",
+            "line-height:1.65",
+        ].join(";");
         document.body.appendChild(stage);
+
+        // Helper: turn translated text into paragraphed HTML
+        function textToParagraphs(text) {
+            var paras = String(text || "").split(/\n{2,}/);
+            return paras.map(function (p) {
+                // Within a paragraph, keep single line breaks but as soft wrap
+                var html = escapeHtml(p).replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+                if (!html) return "";
+                return '<p style="margin:0 0 10px;text-align:justify;text-justify:inter-word;">' + html + '</p>';
+            }).filter(Boolean).join("");
+        }
 
         try {
             for (var p = 0; p < translatedPages.length; p++) {
+                var bodyHtml = textToParagraphs(translatedPages[p]) ||
+                    '<p style="color:#999;font-style:italic;">(halaman kosong / tidak ada teks)</p>';
                 stage.innerHTML = '' +
-                    '<div style="padding:24px 28px;">' +
-                        '<div style="font-size:11px;color:#888;margin-bottom:14px;border-bottom:1px solid #eee;padding-bottom:6px;">' +
+                    '<div style="padding:32px 36px;">' +
+                        '<div style="font-size:10px;color:#999;margin-bottom:18px;border-bottom:1px solid #ddd;padding-bottom:8px;text-align:right;font-family:Arial,sans-serif;">' +
                             escapeHtml(meta.filename) + ' &middot; Halaman ' + (p + 1) + ' / ' + translatedPages.length +
                         '</div>' +
-                        '<div style="white-space:pre-wrap;word-wrap:break-word;">' +
-                            escapeHtml(translatedPages[p] || "(halaman kosong)") +
-                        '</div>' +
+                        '<div>' + bodyHtml + '</div>' +
                     '</div>';
 
                 var canvas = await window.html2canvas(stage, {
