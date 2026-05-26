@@ -9,22 +9,57 @@
 (function () {
     "use strict";
 
-    // ---------- Setup PDF.js worker ----------
-    if (window.pdfjsLib) {
-        pdfjsLib.GlobalWorkerOptions.workerSrc =
-            "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.js";
+    // ---------- CDN fallback loader ----------
+    function loadScript(urls) {
+        return new Promise(function (resolve, reject) {
+            var i = 0;
+            function tryNext() {
+                if (i >= urls.length) return reject(new Error("All CDNs failed: " + urls.join(", ")));
+                var url = urls[i++];
+                var s = document.createElement("script");
+                s.src = url;
+                s.onload = function () { resolve(url); };
+                s.onerror = function () { tryNext(); };
+                document.head.appendChild(s);
+            }
+            tryNext();
+        });
     }
 
-    // ---------- Lazy-load html2canvas (for Unicode-friendly PDF output) ----------
-    function loadHtml2Canvas() {
-        return new Promise(function (resolve, reject) {
-            if (window.html2canvas) return resolve(window.html2canvas);
-            var s = document.createElement("script");
-            s.src = "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js";
-            s.onload = function () { resolve(window.html2canvas); };
-            s.onerror = function () { reject(new Error("Gagal memuat html2canvas")); };
-            document.head.appendChild(s);
-        });
+    // ---------- Ensure PDF.js is loaded (with fallback CDN) ----------
+    async function ensurePdfJs() {
+        if (window.pdfjsLib) return;
+        await loadScript([
+            "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js",
+            "https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.min.js",
+        ]);
+        if (!window.pdfjsLib) throw new Error("pdfjsLib gagal dimuat dari semua CDN");
+    }
+
+    function setPdfJsWorker() {
+        if (!window.pdfjsLib) return;
+        pdfjsLib.GlobalWorkerOptions.workerSrc =
+            "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+    }
+    setPdfJsWorker();
+
+    // ---------- Ensure html2canvas (preloaded in HTML, but fallback just in case) ----------
+    async function ensureHtml2Canvas() {
+        if (window.html2canvas) return;
+        await loadScript([
+            "https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js",
+            "https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js",
+        ]);
+        if (!window.html2canvas) throw new Error("html2canvas gagal dimuat");
+    }
+
+    // ---------- Ensure jsPDF (fallback) ----------
+    async function ensureJsPdf() {
+        if ((window.jspdf && window.jspdf.jsPDF) || window.jsPDF) return;
+        await loadScript([
+            "https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js",
+            "https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js",
+        ]);
     }
 
     // ---------- DOM ----------
@@ -173,6 +208,8 @@
 
     // ---------- PDF text extraction ----------
     async function extractPdfText(file) {
+        await ensurePdfJs();
+        setPdfJsWorker();
         var arrayBuf = await file.arrayBuffer();
         var pdf = await pdfjsLib.getDocument({ data: arrayBuf }).promise;
         var pages = [];
@@ -294,7 +331,8 @@
 
     // ---------- PDF generation (Unicode-safe via html2canvas + jsPDF) ----------
     async function buildPdfFromPages(translatedPages, meta) {
-        await loadHtml2Canvas();
+        await ensureJsPdf();
+        await ensureHtml2Canvas();
         var jsPDFCtor = (window.jspdf && window.jspdf.jsPDF) || window.jsPDF;
         if (!jsPDFCtor) throw new Error("jsPDF tidak tersedia");
 
