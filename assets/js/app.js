@@ -1,22 +1,22 @@
 /* ===================================================================
-   PDF Translate – layout-preserving client-side PDF translator
+   PDF Translate – layout-preserving translator with column-flow reflow
 
-   Strategy:
-   1. For each PDF page:
-      - Render the original page to a canvas (preserves images, vectors,
-        layout — everything except text we'll replace).
-      - Extract text items with their canvas-space coordinates.
-      - Group items into LINES then PARAGRAPHS (so translation has
-        sentence/paragraph context).
-   2. Translate paragraphs in batched calls (joined with double newline).
-   3. For each page canvas:
-      - White-out each paragraph's bounding box.
-      - Re-draw the translated text in the same bbox with auto-fit
-        font sizing and word-wrap.
-   4. Compose into a new PDF using jsPDF (each page = canvas image,
-      same physical dimensions as original).
-
-   Translation: Google Translate public gtx endpoint, fallback MyMemory.
+   Pipeline per page:
+   1. Render original page to canvas (preserves images, vectors).
+   2. Extract text items in canvas-space coords with font metrics.
+   3. Group into LINES → PARAGRAPHS (semantic blocks).
+   4. Translate paragraphs (batched via Google gtx, fallback MyMemory).
+   5. Detect COLUMN STRUCTURE (full-width / left / right), then split
+      each column into vertical "bands" by large y-gaps so headers,
+      body, and footers reflow independently.
+   6. White-out original paragraph bboxes (preserves images that sit
+      between paragraphs).
+   7. For each band: REFLOW translated paragraphs as a flowing
+      column — uniform font scale chosen to fit available height,
+      paragraphs stack top-to-bottom with proper line + paragraph
+      spacing. This is what fixes overlap when translated text is
+      longer than original.
+   8. Compose pages back into a PDF with original physical dimensions.
    =================================================================== */
 
 (function () {
@@ -65,39 +65,21 @@
     ------------------------------------------------------------------ */
     var $ = function (id) { return document.getElementById(id); };
     var els = {
-        uploader: $("uploader"),
-        pickfiles: $("pickfiles"),
-        fileInput: $("fileInput"),
-        fileGroups: $("fileGroups"),
-        actionBar: $("actionBar"),
-        btnTranslate: $("btnTranslate"),
-        btnClear: $("btnClear"),
-        progress: $("progress"),
-        progressText: $("progressText"),
-        progressFill: $("progressFill"),
-        progressSub: $("progressSub"),
-        result: $("result"),
-        btnDownload: $("btnDownload"),
-        btnPreview: $("btnPreview"),
-        btnRestart: $("btnRestart"),
-        preview: $("preview"),
-        previewSrc: $("previewSrc"),
-        previewDst: $("previewDst"),
-        srcLang: $("srcLang"),
-        tgtLang: $("tgtLang"),
-        swapLang: $("swapLang"),
-        errorBox: $("errorBox"),
-        year: $("year"),
+        uploader: $("uploader"), pickfiles: $("pickfiles"), fileInput: $("fileInput"),
+        fileGroups: $("fileGroups"), actionBar: $("actionBar"), btnTranslate: $("btnTranslate"),
+        btnClear: $("btnClear"), progress: $("progress"), progressText: $("progressText"),
+        progressFill: $("progressFill"), progressSub: $("progressSub"), result: $("result"),
+        btnDownload: $("btnDownload"), btnPreview: $("btnPreview"), btnRestart: $("btnRestart"),
+        preview: $("preview"), previewSrc: $("previewSrc"), previewDst: $("previewDst"),
+        srcLang: $("srcLang"), tgtLang: $("tgtLang"), swapLang: $("swapLang"),
+        errorBox: $("errorBox"), year: $("year"),
     };
     if (els.year) els.year.textContent = new Date().getFullYear();
 
-    /* ------------------------------------------------------------------
-       State
-    ------------------------------------------------------------------ */
     var state = { files: [], lastResult: null };
 
     /* ------------------------------------------------------------------
-       Helpers
+       UI helpers
     ------------------------------------------------------------------ */
     function showError(msg) {
         els.errorBox.textContent = msg;
@@ -127,8 +109,7 @@
         Array.prototype.forEach.call(list, function (f) {
             if (f.type !== "application/pdf" && !/\.pdf$/i.test(f.name)) return;
             if (state.files.some(function (x) { return x.name === f.name && x.size === f.size; })) return;
-            state.files.push(f);
-            added++;
+            state.files.push(f); added++;
         });
         if (added === 0 && list.length > 0) showError("Hanya file PDF yang didukung.");
         renderFileList();
@@ -151,33 +132,21 @@
         });
         els.actionBar.classList.toggle("hidden", state.files.length === 0);
     }
-
     els.pickfiles.addEventListener("click", function () { els.fileInput.click(); });
     els.uploader.addEventListener("click", function (e) {
         if (e.target === els.uploader || e.target.classList.contains("uploader__droptxt")) els.fileInput.click();
     });
-    els.fileInput.addEventListener("change", function (e) {
-        addFiles(e.target.files);
-        e.target.value = "";
-    });
+    els.fileInput.addEventListener("change", function (e) { addFiles(e.target.files); e.target.value = ""; });
     ["dragenter", "dragover"].forEach(function (ev) {
-        els.uploader.addEventListener(ev, function (e) {
-            e.preventDefault(); e.stopPropagation();
-            els.uploader.classList.add("is-dragging");
-        });
+        els.uploader.addEventListener(ev, function (e) { e.preventDefault(); e.stopPropagation(); els.uploader.classList.add("is-dragging"); });
     });
     ["dragleave", "drop"].forEach(function (ev) {
-        els.uploader.addEventListener(ev, function (e) {
-            e.preventDefault(); e.stopPropagation();
-            els.uploader.classList.remove("is-dragging");
-        });
+        els.uploader.addEventListener(ev, function (e) { e.preventDefault(); e.stopPropagation(); els.uploader.classList.remove("is-dragging"); });
     });
     els.uploader.addEventListener("drop", function (e) {
         if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files);
     });
-    ["dragover", "drop"].forEach(function (ev) {
-        window.addEventListener(ev, function (e) { e.preventDefault(); }, false);
-    });
+    ["dragover", "drop"].forEach(function (ev) { window.addEventListener(ev, function (e) { e.preventDefault(); }, false); });
     els.btnClear.addEventListener("click", function () { state.files = []; renderFileList(); });
     els.swapLang.addEventListener("click", function () {
         var s = els.srcLang.value, t = els.tgtLang.value;
@@ -186,7 +155,7 @@
     });
 
     /* ------------------------------------------------------------------
-       Paragraph extraction (canvas-space coordinates)
+       Paragraph extraction
     ------------------------------------------------------------------ */
     function joinLineItems(items) {
         items.sort(function (a, b) { return a.x - b.x; });
@@ -209,7 +178,6 @@
         if (items.length === 0) return [];
         items.sort(function (a, b) { return a.y - b.y || a.x - b.x; });
 
-        // Group into lines
         var lines = [];
         var curr = null;
         items.forEach(function (it) {
@@ -231,7 +199,6 @@
             ln.bottom = ln.y + ln.h;
         });
 
-        // Group lines into paragraphs (more permissive thresholds for journal text)
         var paragraphs = [];
         var p = null;
         for (var i = 0; i < lines.length; i++) {
@@ -239,19 +206,13 @@
             if (!p) { p = { lines: [ln] }; paragraphs.push(p); continue; }
             var prev = p.lines[p.lines.length - 1];
             var sameSize = Math.abs(ln.fontSize - prev.fontSize) / Math.max(prev.fontSize, 1) < 0.30;
-            // Same column: x overlap >= 25% of narrower line, OR left edges within fontSize*2
             var overlap = Math.min(prev.x2, ln.x2) - Math.max(prev.x, ln.x);
             var minW = Math.max(Math.min(prev.x2 - prev.x, ln.x2 - ln.x), 1);
-            var sameCol = overlap >= minW * 0.25 ||
-                          Math.abs(ln.x - prev.x) < prev.fontSize * 2;
-            // Close vertically (allow up to 1.6 * fontSize for paragraphs with leading)
+            var sameCol = overlap >= minW * 0.25 || Math.abs(ln.x - prev.x) < prev.fontSize * 2;
             var gap = ln.y - prev.bottom;
             var closeY = gap < prev.fontSize * 1.6 && gap >= -3;
-            if (sameSize && sameCol && closeY) {
-                p.lines.push(ln);
-            } else {
-                p = { lines: [ln] }; paragraphs.push(p);
-            }
+            if (sameSize && sameCol && closeY) p.lines.push(ln);
+            else { p = { lines: [ln] }; paragraphs.push(p); }
         }
 
         return paragraphs.map(function (p) {
@@ -260,7 +221,6 @@
             var y = Math.min.apply(null, p.lines.map(function (l) { return l.y; }));
             var y2 = Math.max.apply(null, p.lines.map(function (l) { return l.bottom; }));
             var text = p.lines.map(function (l) { return l.text; }).join(" ").replace(/\s+/g, " ").trim();
-            // Fix mid-word hyphenation (English only)
             text = text.replace(/(\w+)-\s+(\w+)/g, "$1$2");
             var fontSize = p.lines.reduce(function (s, l) { return s + l.fontSize; }, 0) / p.lines.length;
             return { bbox: { x: x, y: y, w: x2 - x, h: y2 - y }, text: text, fontSize: fontSize };
@@ -268,9 +228,9 @@
     }
 
     /* ------------------------------------------------------------------
-       Render a PDF page → { canvas, paragraphs, ptW, ptH }
+       Render PDF page → canvas + paragraphs
     ------------------------------------------------------------------ */
-    var RENDER_SCALE = 1.5; // canvas pixels per PDF point. Higher = better quality but more memory.
+    var RENDER_SCALE = 1.5;
     var CMAP_URL = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/cmaps/";
 
     function loadPdfDocument(arrayBuffer) {
@@ -290,40 +250,21 @@
         canvas.height = Math.ceil(viewport.height);
         var ctx = canvas.getContext("2d");
 
-        await page.render({
-            canvasContext: ctx,
-            viewport: viewport,
-            background: "#ffffff",
-        }).promise;
+        await page.render({ canvasContext: ctx, viewport: viewport, background: "#ffffff" }).promise;
 
-        var content = await page.getTextContent({
-            includeMarkedContent: false,
-            disableNormalization: false,
-        });
-
+        var content = await page.getTextContent({ includeMarkedContent: false, disableNormalization: false });
         var items = content.items
             .filter(function (it) { return it && typeof it.str === "string" && it.str.length; })
             .map(function (it) {
                 var tx = pdfjsLib.Util.transform(viewport.transform, it.transform);
-                // Font size in canvas pixels (vertical scale magnitude)
                 var fontHeight = Math.abs(Math.hypot(tx[2], tx[3])) || 10;
-                // Horizontal scale (in case text is non-uniformly scaled)
                 var hScale = Math.abs(Math.hypot(tx[0], tx[1])) || fontHeight;
-                // Width: PDF.js gives item.width in user-space units (pre-transform).
-                // Multiply by horizontal scale to get canvas-space width.
                 var widthCanvas = (typeof it.width === "number" ? it.width : 0) * hScale / Math.max(it.height || 1, 0.0001);
-                if (!isFinite(widthCanvas) || widthCanvas <= 0) {
-                    // Fallback: estimate from string length
-                    widthCanvas = (it.str.length || 1) * fontHeight * 0.5;
-                }
+                if (!isFinite(widthCanvas) || widthCanvas <= 0) widthCanvas = (it.str.length || 1) * fontHeight * 0.5;
                 var ascent = fontHeight * 0.82;
                 return {
-                    str: it.str,
-                    x: tx[4],
-                    y: tx[5] - ascent, // top of text in canvas coords
-                    width: widthCanvas,
-                    height: fontHeight * 1.15, // include descender
-                    fontSize: fontHeight,
+                    str: it.str, x: tx[4], y: tx[5] - ascent,
+                    width: widthCanvas, height: fontHeight * 1.15, fontSize: fontHeight,
                 };
             })
             .filter(function (it) {
@@ -333,11 +274,9 @@
                        it.x < canvas.width + 50 && it.y < canvas.height + 50;
             });
 
-        var paragraphs = extractParagraphs(items);
-
         return {
             canvas: canvas,
-            paragraphs: paragraphs,
+            paragraphs: extractParagraphs(items),
             ptW: viewport.width / RENDER_SCALE,
             ptH: viewport.height / RENDER_SCALE,
             canvasW: canvas.width,
@@ -369,67 +308,47 @@
         return d.responseData.translatedText;
     }
 
-    // Translate an array of paragraphs by batching them with `\n\n` separators
-    // (Google Translate preserves paragraph breaks reliably).
     async function translateParagraphsBatched(paragraphs, sl, tl, onProgress) {
         if (paragraphs.length === 0) return;
-
         var SEP = "\n\n";
         var GOOGLE_LIMIT = 4500;
         var MYMEM_LIMIT = 480;
 
-        // Build batches per provider
         function makeBatches(limit) {
-            var batches = [];
-            var curr = [];
-            var len = 0;
+            var batches = [], curr = [], len = 0;
             paragraphs.forEach(function (p) {
                 var pLen = p.text.length + SEP.length;
-                if (len + pLen > limit && curr.length > 0) {
-                    batches.push(curr);
-                    curr = [];
-                    len = 0;
-                }
-                curr.push(p);
-                len += pLen;
+                if (len + pLen > limit && curr.length > 0) { batches.push(curr); curr = []; len = 0; }
+                curr.push(p); len += pLen;
             });
             if (curr.length) batches.push(curr);
             return batches;
         }
 
-        // Try Google in larger batches
         try {
             var batches = makeBatches(GOOGLE_LIMIT);
             var done = 0;
             for (var i = 0; i < batches.length; i++) {
                 var batch = batches[i];
-                // Replace internal newlines so Google doesn't re-split
                 var combined = batch.map(function (p) { return p.text.replace(/\n+/g, " "); }).join(SEP);
                 var translated = await translateGoogle(combined, sl, tl);
                 var parts = translated.split(/\n\n+/);
-                // Best-effort alignment: if mismatch, also try \n
-                if (parts.length !== batch.length) {
-                    parts = translated.split(/\n+/);
-                }
-                for (var j = 0; j < batch.length; j++) {
-                    batch[j].translatedText = (parts[j] || batch[j].text).trim();
-                }
+                if (parts.length !== batch.length) parts = translated.split(/\n+/);
+                for (var j = 0; j < batch.length; j++) batch[j].translatedText = (parts[j] || batch[j].text).trim();
                 done += batch.length;
                 if (onProgress) onProgress(done, paragraphs.length);
             }
             return;
         } catch (gErr) {
-            console.warn("Google batch failed, falling back to MyMemory per-paragraph:", gErr);
+            console.warn("Google batch failed, falling back to MyMemory:", gErr);
         }
 
-        // Fallback: MyMemory per-paragraph (smaller limit, no batching)
         for (var k = 0; k < paragraphs.length; k++) {
             var p = paragraphs[k];
             try {
                 if (p.text.length <= MYMEM_LIMIT) {
                     p.translatedText = await translateMyMemory(p.text, sl, tl);
                 } else {
-                    // Split by sentence
                     var sentences = p.text.match(/[^.!?]+[.!?]+|\S[\s\S]{0,400}/g) || [p.text];
                     var out = [];
                     for (var s = 0; s < sentences.length; s++) {
@@ -440,16 +359,17 @@
                     }
                     p.translatedText = out.join(" ");
                 }
-            } catch (e) {
-                p.translatedText = p.text;
-            }
+            } catch (e) { p.translatedText = p.text; }
             if (onProgress) onProgress(k + 1, paragraphs.length);
         }
     }
 
     /* ------------------------------------------------------------------
-       Draw translated text onto canvas (white-out + auto-fit)
+       Column-flow reflow engine
+       This is the core of layout-preserving translation.
     ------------------------------------------------------------------ */
+    var FONT_FAMILY = "Georgia, 'Times New Roman', 'Noto Serif', 'Noto Sans', 'Noto Sans CJK SC', 'Noto Sans Arabic', serif";
+
     function wrapText(ctx, text, maxWidth) {
         var lines = [];
         var paragraphs = String(text).split(/\n+/);
@@ -465,7 +385,6 @@
                 } else {
                     if (line) lines.push(line);
                     if (ctx.measureText(w).width > maxWidth) {
-                        // Hard-break long word
                         var buf = "";
                         for (var c = 0; c < w.length; c++) {
                             if (ctx.measureText(buf + w[c]).width > maxWidth) {
@@ -482,52 +401,162 @@
         return lines;
     }
 
-    function drawAutoFitText(ctx, text, bbox, originalSize, canvasH) {
+    // Step 1: classify each paragraph into a column (full / left / right)
+    function classifyColumns(paragraphs, canvasW) {
+        var midX = canvasW / 2;
+        // Filter "significant" paragraphs (real body text) for layout decisions
+        var significant = paragraphs.filter(function (p) {
+            return p.text.length > 25 && p.fontSize >= 7;
+        });
+        if (significant.length === 0) significant = paragraphs;
+
+        // First-pass classification per paragraph
+        paragraphs.forEach(function (p) {
+            var x2 = p.bbox.x + p.bbox.w;
+            var cx = p.bbox.x + p.bbox.w / 2;
+            // Spans most of page width? → full
+            if (p.bbox.w > canvasW * 0.6 || (p.bbox.x < midX - 30 && x2 > midX + 30)) {
+                p.column = "full";
+            } else if (cx < midX) {
+                p.column = "left";
+            } else {
+                p.column = "right";
+            }
+        });
+
+        // Decide: is page actually 2-column, or single column?
+        var leftN = paragraphs.filter(function (p) { return p.column === "left" && p.text.length > 30; }).length;
+        var rightN = paragraphs.filter(function (p) { return p.column === "right" && p.text.length > 30; }).length;
+        var isTwoCol = leftN >= 2 && rightN >= 2;
+
+        if (!isTwoCol) {
+            paragraphs.forEach(function (p) { p.column = "full"; });
+        }
+    }
+
+    // Step 2: split each column into VERTICAL BANDS
+    // (paragraphs separated by big y-gaps form independent reflow regions —
+    //  this keeps headers, body, and footers layout-independent)
+    function splitColumnIntoBands(paragraphs) {
+        if (paragraphs.length === 0) return [];
+        paragraphs.sort(function (a, b) { return a.bbox.y - b.bbox.y; });
+
+        // Compute median font size for gap threshold
+        var fontSizes = paragraphs.map(function (p) { return p.fontSize; }).sort(function (a, b) { return a - b; });
+        var medianFs = fontSizes[Math.floor(fontSizes.length / 2)] || 12;
+
+        var bands = [];
+        var curr = [paragraphs[0]];
+        for (var i = 1; i < paragraphs.length; i++) {
+            var prev = curr[curr.length - 1];
+            var gap = paragraphs[i].bbox.y - (prev.bbox.y + prev.bbox.h);
+            // Band split if gap > 4× median font size (i.e., a clear blank section divider)
+            var threshold = Math.max(medianFs * 4, 30);
+            if (gap > threshold) {
+                bands.push(curr);
+                curr = [paragraphs[i]];
+            } else {
+                curr.push(paragraphs[i]);
+            }
+        }
+        bands.push(curr);
+        return bands;
+    }
+
+    // Step 3: build "regions" — each region is a flow container
+    function buildRegions(paragraphs, canvasW) {
+        classifyColumns(paragraphs, canvasW);
+
+        var byCol = { full: [], left: [], right: [] };
+        paragraphs.forEach(function (p) { byCol[p.column].push(p); });
+
+        var regions = [];
+        ["full", "left", "right"].forEach(function (col) {
+            var bands = splitColumnIntoBands(byCol[col]);
+            bands.forEach(function (band) {
+                if (band.length === 0) return;
+                var x = Math.min.apply(null, band.map(function (p) { return p.bbox.x; }));
+                var x2 = Math.max.apply(null, band.map(function (p) { return p.bbox.x + p.bbox.w; }));
+                var y = Math.min.apply(null, band.map(function (p) { return p.bbox.y; }));
+                var y2 = Math.max.apply(null, band.map(function (p) { return p.bbox.y + p.bbox.h; }));
+                regions.push({
+                    col: col, paragraphs: band,
+                    x: x, y: y, x2: x2, y2: y2,
+                    w: x2 - x, h: y2 - y,
+                });
+            });
+        });
+        return regions;
+    }
+
+    // Step 4: reflow + draw a single region
+    function reflowAndDraw(ctx, region, canvasH) {
+        var colW = region.w;
+        var availH = region.h;
+
+        // Layout text at a given uniform scale; returns total height needed
+        function layout(scale) {
+            var items = [];
+            var totalH = 0;
+            for (var i = 0; i < region.paragraphs.length; i++) {
+                var p = region.paragraphs[i];
+                var fs = Math.max(6, p.fontSize * scale);
+                ctx.font = fs + "px " + FONT_FAMILY;
+                var lh = fs * 1.18;
+                var paraGap = fs * 0.42;
+                var text = (p.translatedText && p.translatedText.trim()) ? p.translatedText : p.text;
+                var lines = wrapText(ctx, text, colW);
+                items.push({ fs: fs, lh: lh, paraGap: paraGap, lines: lines });
+                totalH += lines.length * lh + paraGap;
+            }
+            if (items.length > 0) totalH -= items[items.length - 1].paraGap;
+            return { items: items, totalH: totalH };
+        }
+
+        // Iteratively shrink to fit available height (text wrap changes with size,
+        // so we re-layout up to a few times to converge)
+        var scale = 1;
+        var fit = layout(scale);
+        var iters = 0;
+        var minScale = 0.55;
+        // Allow up to 8% overflow before shrinking
+        while (fit.totalH > availH * 1.08 && scale > minScale && iters < 10) {
+            scale = Math.max(minScale, (availH * 0.97) / fit.totalH);
+            fit = layout(scale);
+            iters++;
+        }
+
+        // Draw with clipping (so worst-case overflow doesn't bleed onto neighbors)
+        ctx.save();
         ctx.fillStyle = "#111";
         ctx.textBaseline = "top";
-
-        var fontFamily = "Georgia, 'Times New Roman', 'Noto Serif', 'Noto Sans', 'Noto Sans CJK SC', 'Noto Sans Arabic', serif";
-        var size = originalSize;
-        var minSize = Math.max(originalSize * 0.5, 7);
-        // Allow vertical overflow up to 30% beyond bbox (for cases where translated text is much longer)
-        var hardMaxH = Math.min(bbox.h * 1.4, (canvasH || (bbox.y + bbox.h * 1.4)) - bbox.y - 4);
-
-        function tryFit(s) {
-            ctx.font = s + "px " + fontFamily;
-            var lh = s * 1.18;
-            var lines = wrapText(ctx, text, bbox.w);
-            return { lines: lines, totalH: lines.length * lh, lh: lh };
-        }
-
-        var fit = tryFit(size);
-        // Shrink while text doesn't fit even in the expanded budget
-        while (fit.totalH > hardMaxH && size > minSize) {
-            size = Math.max(minSize, size - 0.5);
-            fit = tryFit(size);
-        }
-
-        // Clip drawing region so text never spills far past bbox
-        ctx.save();
+        // Allow tiny overflow padding (hardMaxH = region height + 1 line of slack)
+        var slack = (region.paragraphs[0] ? region.paragraphs[0].fontSize : 12) * 1.5;
+        var clipBottom = Math.min((region.y + region.h + slack), canvasH - 2);
         ctx.beginPath();
-        ctx.rect(bbox.x - 1, bbox.y - 1, bbox.w + 2, hardMaxH + 2);
+        ctx.rect(region.x - 1, region.y - 1, region.w + 2, clipBottom - region.y + 2);
         ctx.clip();
 
-        var y = bbox.y;
-        for (var i = 0; i < fit.lines.length; i++) {
-            ctx.fillText(fit.lines[i], bbox.x, y);
-            y += fit.lh;
+        var y = region.y;
+        for (var i = 0; i < fit.items.length; i++) {
+            var item = fit.items[i];
+            ctx.font = item.fs + "px " + FONT_FAMILY;
+            for (var j = 0; j < item.lines.length; j++) {
+                ctx.fillText(item.lines[j], region.x, y);
+                y += item.lh;
+            }
+            y += item.paraGap;
         }
         ctx.restore();
     }
 
-    function applyTranslationsToCanvas(pageData) {
-        var ctx = pageData.canvas.getContext("2d");
-        // White-out all paragraph bboxes first (so neighboring overlap doesn't reveal old text).
-        // Use generous padding to fully cover any anti-aliased pixels of the original text.
+    // Step 5: white-out original paragraphs (preserves images outside text)
+    function whiteOutOriginalText(ctx, paragraphs) {
         ctx.save();
         ctx.fillStyle = "#ffffff";
-        pageData.paragraphs.forEach(function (p) {
-            var pad = Math.max(3, p.fontSize * 0.15);
+        paragraphs.forEach(function (p) {
+            // Generous padding to fully cover any anti-aliased glyph pixels
+            var pad = Math.max(3, p.fontSize * 0.2);
             ctx.fillRect(
                 p.bbox.x - pad,
                 p.bbox.y - pad,
@@ -536,10 +565,21 @@
             );
         });
         ctx.restore();
-        // Draw translated text
-        pageData.paragraphs.forEach(function (p) {
-            if (!p.translatedText) return;
-            drawAutoFitText(ctx, p.translatedText, p.bbox, p.fontSize, pageData.canvasH);
+    }
+
+    function applyTranslationsToCanvas(pageData) {
+        if (!pageData.paragraphs || pageData.paragraphs.length === 0) return;
+        var ctx = pageData.canvas.getContext("2d");
+
+        // 1. Erase all original text
+        whiteOutOriginalText(ctx, pageData.paragraphs);
+
+        // 2. Build column-aware reflow regions
+        var regions = buildRegions(pageData.paragraphs, pageData.canvasW);
+
+        // 3. Reflow + draw each region
+        regions.forEach(function (region) {
+            reflowAndDraw(ctx, region, pageData.canvasH);
         });
     }
 
@@ -552,7 +592,6 @@
         var tl = els.tgtLang.value || "id";
         if (sl === tl) { showError("Bahasa sumber dan tujuan tidak boleh sama."); return; }
 
-        // UI state
         els.actionBar.classList.add("hidden");
         els.fileGroups.classList.add("hidden");
         document.getElementById("uploader").classList.add("hidden");
@@ -566,7 +605,6 @@
             await ensureJsPdf();
             var jsPDFCtor = (window.jspdf && window.jspdf.jsPDF) || window.jsPDF;
 
-            // Compute total page count for progress
             var docs = [];
             var totalPages = 0;
             for (var fi = 0; fi < state.files.length; fi++) {
@@ -583,16 +621,13 @@
 
             for (var di = 0; di < docs.length; di++) {
                 var entry = docs[di];
-
                 for (var pn = 1; pn <= entry.doc.numPages; pn++) {
                     pagePtr++;
                     els.progressText.textContent = "Memproses halaman " + pagePtr + " / " + totalPages;
                     setProgress(5 + (pagePtr - 1) / totalPages * 30, "Render: " + entry.name + " hal. " + pn);
 
-                    // 1. Render + extract
                     var pageData = await renderPageWithMeta(entry.doc, pn);
 
-                    // 2. Translate paragraphs
                     setProgress(5 + (pagePtr - 1) / totalPages * 30 + 10 / totalPages, "Menerjemahkan halaman " + pagePtr);
                     if (pageData.paragraphs.length > 0) {
                         await translateParagraphsBatched(pageData.paragraphs, sl, tl, function (done, total) {
@@ -601,28 +636,20 @@
                         });
                     }
 
-                    // 3. Save snapshots for preview
                     allSrcPages.push(pageData.paragraphs.map(function (p) { return p.text; }).join("\n\n"));
                     allDstPages.push(pageData.paragraphs.map(function (p) { return p.translatedText || ""; }).join("\n\n"));
 
-                    // 4. Apply translations to canvas
                     applyTranslationsToCanvas(pageData);
 
-                    // 5. Add to PDF
                     var orientation = pageData.ptW > pageData.ptH ? "landscape" : "portrait";
                     if (!pdf) {
-                        pdf = new jsPDFCtor({
-                            unit: "pt",
-                            format: [pageData.ptW, pageData.ptH],
-                            orientation: orientation,
-                        });
+                        pdf = new jsPDFCtor({ unit: "pt", format: [pageData.ptW, pageData.ptH], orientation: orientation });
                     } else {
                         pdf.addPage([pageData.ptW, pageData.ptH], orientation);
                     }
                     var imgData = pageData.canvas.toDataURL("image/jpeg", 0.85);
                     pdf.addImage(imgData, "JPEG", 0, 0, pageData.ptW, pageData.ptH);
 
-                    // 6. Free memory
                     pageData.canvas.width = 0;
                     pageData.canvas.height = 0;
                     pageData.canvas = null;
@@ -634,12 +661,7 @@
             var primary = state.files[0].name.replace(/\.pdf$/i, "");
             var outName = primary + "_translated_" + tl + ".pdf";
 
-            state.lastResult = {
-                pagesSrc: allSrcPages,
-                pagesDst: allDstPages,
-                filename: outName,
-                blob: blob,
-            };
+            state.lastResult = { pagesSrc: allSrcPages, pagesDst: allDstPages, filename: outName, blob: blob };
 
             setProgress(100, "Selesai!");
             els.progress.classList.add("hidden");
