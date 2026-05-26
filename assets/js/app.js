@@ -370,6 +370,24 @@
     ------------------------------------------------------------------ */
     var FONT_FAMILY = "Georgia, 'Times New Roman', 'Noto Serif', 'Noto Sans', 'Noto Sans CJK SC', 'Noto Sans Arabic', serif";
 
+    // Per-role spacing configuration. Each role has its own line-height,
+    // paragraph-gap, and minimum shrink scale tuned for that semantic context.
+    //   lh        : line-height multiplier (× fontSize)
+    //   gapFactor : fallback paragraph gap when original gap is unavailable
+    //   scaleMin  : minimum uniform shrink before clipping kicks in
+    var SPACING_BY_ROLE = {
+        title:           { lh: 1.20, gapFactor: 0.80, scaleMin: 0.70 },
+        author:          { lh: 1.22, gapFactor: 0.50, scaleMin: 0.65 },
+        affiliation:     { lh: 1.18, gapFactor: 0.30, scaleMin: 0.60 },
+        sidebar:         { lh: 1.30, gapFactor: 0.55, scaleMin: 0.65 },
+        abstract:        { lh: 1.45, gapFactor: 0.65, scaleMin: 0.65 },
+        keywords:        { lh: 1.30, gapFactor: 0.40, scaleMin: 0.70 },
+        "keywords-label":{ lh: 1.20, gapFactor: 0.35, scaleMin: 0.80 },
+        header:          { lh: 1.15, gapFactor: 0.25, scaleMin: 0.60 },
+        footer:          { lh: 1.15, gapFactor: 0.25, scaleMin: 0.60 },
+        body:            { lh: 1.18, gapFactor: 0.42, scaleMin: 0.55 },
+    };
+
     function wrapText(ctx, text, maxWidth) {
         var lines = [];
         var paragraphs = String(text).split(/\n+/);
@@ -399,6 +417,112 @@
             if (line) lines.push(line);
         });
         return lines;
+    }
+
+    // ------- Semantic role classification (cover-page aware) -------
+    //
+    // Detects journal-cover-style structural roles using font size, position,
+    // width, and content patterns. Roles drive both the white-out grouping
+    // and the per-zone spacing config.
+    function classifySemanticRole(paragraphs, canvasW, canvasH) {
+        if (paragraphs.length === 0) return;
+
+        var significantFs = paragraphs
+            .filter(function (p) { return p.text.length > 20; })
+            .map(function (p) { return p.fontSize; })
+            .sort(function (a, b) { return a - b; });
+        var medianFs = significantFs.length ? significantFs[Math.floor(significantFs.length / 2)] : 12;
+
+        // Sidebar marker keywords (Frontiers + general academic cover pages, EN/ID/ES/etc)
+        var SIDEBAR_KEYS = /\b(OPEN\s*ACCESS|EDITED\s*BY|REVIEWED\s*BY|RECEIVED|ACCEPTED|PUBLISHED|CITATION|COPYRIGHT|CORRESPONDENCE|TYPE|DOI|BUKA\s*AKSES|DIEDIT\s*OLEH|DITINJAU\s*OLEH|DITERIMA|HAK\s*CIPTA|TIPE|KORESPONDENSI)\b/i;
+
+        paragraphs.forEach(function (p) {
+            var x = p.bbox.x;
+            var x2 = p.bbox.x + p.bbox.w;
+            var w = p.bbox.w;
+            var yc = p.bbox.y + p.bbox.h / 2;
+            var fs = p.fontSize;
+            var text = p.text.trim();
+
+            // FOOTER: bottom 5%
+            if (yc > canvasH * 0.94) { p.role = "footer"; return; }
+            // HEADER: top 5%
+            if (yc < canvasH * 0.06) { p.role = "header"; return; }
+
+            // SIDEBAR (editorial metadata): narrow paragraph in left ~30% of page,
+            // OR in right ~30% near top with editorial markers (DOI block on right side)
+            var isLeftSidebar = x2 < canvasW * 0.30 && w < canvasW * 0.30;
+            var isRightDoiBlock = x > canvasW * 0.65 && yc < canvasH * 0.18 && w < canvasW * 0.35;
+            if ((isLeftSidebar || isRightDoiBlock) && fs < medianFs * 1.4) {
+                p.role = "sidebar";
+                return;
+            }
+            // Sidebar by content keyword (catches multi-line CITATION/COPYRIGHT blocks
+            // that may wrap wider than the narrow column)
+            if (x2 < canvasW * 0.40 && fs < medianFs * 1.1 && SIDEBAR_KEYS.test(text)) {
+                p.role = "sidebar";
+                return;
+            }
+
+            // TITLE: large font in top half, reasonably wide
+            if (fs > medianFs * 1.35 && yc < canvasH * 0.50 && w > canvasW * 0.20) {
+                p.role = "title";
+                return;
+            }
+
+            // AUTHOR LIST: medium font in top 40%, comma-separated names
+            // Heuristic: contains commas + capitalized name-like words + not too long
+            var commaCount = (text.match(/,/g) || []).length;
+            var capWords = (text.match(/[A-ZÁ-Úİ][a-zá-úı]{2,}/g) || []).length;
+            var hasNamePattern = commaCount >= 1 && capWords >= 3;
+            if (yc < canvasH * 0.40 && fs >= medianFs * 0.85 && fs <= medianFs * 1.25
+                && hasNamePattern && text.length < 500) {
+                p.role = "author";
+                return;
+            }
+
+            // AFFILIATION: smaller font in top half, numbered or institutional words
+            var affilLooks = /^\s*\d+\s*[A-ZÁ-Ú]/.test(text)
+                || /\b(University|Universitas|Institut|Department|Departemen|Research|Hospital|School|Faculty|Fakultas|College|Colegio|Universidad|Université|Università)\b/i.test(text);
+            if (yc < canvasH * 0.55 && fs < medianFs * 0.95 && affilLooks) {
+                p.role = "affiliation";
+                return;
+            }
+
+            // KEYWORDS label
+            if (text.length < 40 && /^(KEYWORDS|KATA\s*KUNCI|PALABRAS\s*CLAVE|MOTS-CLÉS)\s*:?\s*$/i.test(text)) {
+                p.role = "keywords-label";
+                return;
+            }
+
+            // Default: body (will be column-classified later)
+            p.role = "body";
+        });
+
+        // Post-pass 1: paragraph immediately after KEYWORDS label → keyword list
+        var sorted = paragraphs.slice().sort(function (a, b) { return a.bbox.y - b.bbox.y; });
+        for (var i = 0; i < sorted.length - 1; i++) {
+            if (sorted[i].role === "keywords-label") {
+                for (var j = i + 1; j < sorted.length; j++) {
+                    if (sorted[j].role === "body" &&
+                        Math.abs(sorted[j].bbox.x - sorted[i].bbox.x) < 80) {
+                        sorted[j].role = "keywords";
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Post-pass 2: detect ABSTRACT — first big body paragraph in top 60% of page
+        // (only relevant on cover pages; other pages will simply have no early big body block)
+        var topBodyCandidates = sorted.filter(function (p) {
+            return p.role === "body"
+                && (p.bbox.y + p.bbox.h / 2) < canvasH * 0.60
+                && p.text.length > 250;
+        });
+        if (topBodyCandidates.length > 0) {
+            topBodyCandidates[0].role = "abstract";
+        }
     }
 
     // Step 1: classify each paragraph into a column (full / left / right)
@@ -463,38 +587,89 @@
         return bands;
     }
 
-    // Step 3: build "regions" — each region is a flow container
-    function buildRegions(paragraphs, canvasW) {
-        classifyColumns(paragraphs, canvasW);
+    // Step 3: build "regions" — each region is an INDEPENDENT flow container
+    //         with its own role + spacing config.
+    //
+    // - Body paragraphs → split by column (full/left/right) then by vertical
+    //   bands (so headers/body/footers within a column are independent).
+    // - Other roles (title, author, affiliation, sidebar, abstract, keywords,
+    //   header, footer) become their own regions, clustered as one zone per
+    //   role (with band-splitting for sidebar/header/footer where multiple
+    //   distinct items typically exist).
+    function buildRegions(paragraphs, canvasW, canvasH) {
+        // 1. Semantic role classification (cover-page aware)
+        classifySemanticRole(paragraphs, canvasW, canvasH);
 
-        var byCol = { full: [], left: [], right: [] };
-        paragraphs.forEach(function (p) { byCol[p.column].push(p); });
+        // 2. Group by role
+        var byRole = {};
+        paragraphs.forEach(function (p) {
+            var r = p.role || "body";
+            (byRole[r] = byRole[r] || []).push(p);
+        });
+
+        // 3. For 'body' paragraphs: column-classify and band-split
+        if (byRole.body && byRole.body.length > 0) {
+            classifyColumns(byRole.body, canvasW);
+        }
+
+        function makeRegion(role, ps) {
+            if (!ps || ps.length === 0) return null;
+            ps.sort(function (a, b) { return a.bbox.y - b.bbox.y; });
+            var x  = Math.min.apply(null, ps.map(function (p) { return p.bbox.x; }));
+            var x2 = Math.max.apply(null, ps.map(function (p) { return p.bbox.x + p.bbox.w; }));
+            var y  = Math.min.apply(null, ps.map(function (p) { return p.bbox.y; }));
+            var y2 = Math.max.apply(null, ps.map(function (p) { return p.bbox.y + p.bbox.h; }));
+            return {
+                role: role, paragraphs: ps,
+                x: x, y: y, x2: x2, y2: y2, w: x2 - x, h: y2 - y,
+                spacing: SPACING_BY_ROLE[role] || SPACING_BY_ROLE.body,
+            };
+        }
 
         var regions = [];
-        ["full", "left", "right"].forEach(function (col) {
-            var bands = splitColumnIntoBands(byCol[col]);
-            bands.forEach(function (band) {
-                if (band.length === 0) return;
-                var x = Math.min.apply(null, band.map(function (p) { return p.bbox.x; }));
-                var x2 = Math.max.apply(null, band.map(function (p) { return p.bbox.x + p.bbox.w; }));
-                var y = Math.min.apply(null, band.map(function (p) { return p.bbox.y; }));
-                var y2 = Math.max.apply(null, band.map(function (p) { return p.bbox.y + p.bbox.h; }));
-                regions.push({
-                    col: col, paragraphs: band,
-                    x: x, y: y, x2: x2, y2: y2,
-                    w: x2 - x, h: y2 - y,
+
+        // Body: per-column band split
+        if (byRole.body && byRole.body.length > 0) {
+            var byCol = { full: [], left: [], right: [] };
+            byRole.body.forEach(function (p) { byCol[p.column].push(p); });
+            ["full", "left", "right"].forEach(function (col) {
+                var bands = splitColumnIntoBands(byCol[col]);
+                bands.forEach(function (band) {
+                    var r = makeRegion("body", band);
+                    if (r) regions.push(r);
                 });
             });
+        }
+
+        // Sidebar/header/footer: also band-split since they often have multiple
+        // distinct items separated by vertical gaps (OPEN ACCESS / EDITED BY / ...)
+        ["sidebar", "header", "footer"].forEach(function (role) {
+            if (!byRole[role]) return;
+            var bands = splitColumnIntoBands(byRole[role]);
+            bands.forEach(function (band) {
+                var r = makeRegion(role, band);
+                if (r) regions.push(r);
+            });
         });
+
+        // Single-zone roles: title / author / affiliation / abstract / keywords
+        ["title", "author", "affiliation", "abstract", "keywords-label", "keywords"].forEach(function (role) {
+            if (!byRole[role]) return;
+            var r = makeRegion(role, byRole[role]);
+            if (r) regions.push(r);
+        });
+
         return regions;
     }
 
-    // Step 4: reflow + draw a single region
+    // Step 4: reflow + draw a single region using its role-specific spacing
     function reflowAndDraw(ctx, region, canvasH) {
         var colW = region.w;
         var availH = region.h;
+        var sp = region.spacing || SPACING_BY_ROLE.body;
 
-        // Layout text at a given uniform scale; returns total height needed
+        // Layout text at a uniform scale; uses ORIGINAL inter-paragraph gaps
+        // (scaled) when available so spacing pattern of the source is preserved.
         function layout(scale) {
             var items = [];
             var totalH = 0;
@@ -502,26 +677,33 @@
                 var p = region.paragraphs[i];
                 var fs = Math.max(6, p.fontSize * scale);
                 ctx.font = fs + "px " + FONT_FAMILY;
-                var lh = fs * 1.18;
-                var paraGap = fs * 0.42;
+                var lh = fs * sp.lh;
                 var text = (p.translatedText && p.translatedText.trim()) ? p.translatedText : p.text;
                 var lines = wrapText(ctx, text, colW);
+
+                // Inter-paragraph gap: prefer original (scaled), fall back to gapFactor
+                var paraGap = 0;
+                if (i < region.paragraphs.length - 1) {
+                    var next = region.paragraphs[i + 1];
+                    var origGap = next.bbox.y - (p.bbox.y + p.bbox.h);
+                    if (isFinite(origGap) && origGap > 0) {
+                        paraGap = Math.max(origGap * scale, fs * 0.2);
+                    } else {
+                        paraGap = fs * sp.gapFactor;
+                    }
+                }
                 items.push({ fs: fs, lh: lh, paraGap: paraGap, lines: lines });
                 totalH += lines.length * lh + paraGap;
             }
-            if (items.length > 0) totalH -= items[items.length - 1].paraGap;
             return { items: items, totalH: totalH };
         }
 
-        // Iteratively shrink to fit available height (text wrap changes with size,
-        // so we re-layout up to a few times to converge)
         var scale = 1;
         var fit = layout(scale);
         var iters = 0;
-        var minScale = 0.55;
         // Allow up to 8% overflow before shrinking
-        while (fit.totalH > availH * 1.08 && scale > minScale && iters < 10) {
-            scale = Math.max(minScale, (availH * 0.97) / fit.totalH);
+        while (fit.totalH > availH * 1.08 && scale > sp.scaleMin && iters < 10) {
+            scale = Math.max(sp.scaleMin, (availH * 0.97) / fit.totalH);
             fit = layout(scale);
             iters++;
         }
@@ -530,7 +712,6 @@
         ctx.save();
         ctx.fillStyle = "#111";
         ctx.textBaseline = "top";
-        // Allow tiny overflow padding (hardMaxH = region height + 1 line of slack)
         var slack = (region.paragraphs[0] ? region.paragraphs[0].fontSize : 12) * 1.5;
         var clipBottom = Math.min((region.y + region.h + slack), canvasH - 2);
         ctx.beginPath();
@@ -575,7 +756,7 @@
         whiteOutOriginalText(ctx, pageData.paragraphs);
 
         // 2. Build column-aware reflow regions
-        var regions = buildRegions(pageData.paragraphs, pageData.canvasW);
+        var regions = buildRegions(pageData.paragraphs, pageData.canvasW, pageData.canvasH);
 
         // 3. Reflow + draw each region
         regions.forEach(function (region) {
