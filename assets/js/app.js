@@ -281,6 +281,7 @@
             ptH: viewport.height / RENDER_SCALE,
             canvasW: canvas.width,
             canvasH: canvas.height,
+            pageNum: pageNum,
         };
     }
 
@@ -376,16 +377,16 @@
     //   gapFactor : fallback paragraph gap when original gap is unavailable
     //   scaleMin  : minimum uniform shrink before clipping kicks in
     var SPACING_BY_ROLE = {
-        title:           { lh: 1.20, gapFactor: 0.80, scaleMin: 0.70 },
-        author:          { lh: 1.22, gapFactor: 0.50, scaleMin: 0.65 },
-        affiliation:     { lh: 1.18, gapFactor: 0.30, scaleMin: 0.60 },
-        sidebar:         { lh: 1.30, gapFactor: 0.55, scaleMin: 0.65 },
-        abstract:        { lh: 1.45, gapFactor: 0.65, scaleMin: 0.65 },
-        keywords:        { lh: 1.30, gapFactor: 0.40, scaleMin: 0.70 },
-        "keywords-label":{ lh: 1.20, gapFactor: 0.35, scaleMin: 0.80 },
-        header:          { lh: 1.15, gapFactor: 0.25, scaleMin: 0.60 },
-        footer:          { lh: 1.15, gapFactor: 0.25, scaleMin: 0.60 },
-        body:            { lh: 1.18, gapFactor: 0.42, scaleMin: 0.55 },
+        title:           { lh: 1.20, gapFactor: 0.80, scaleMin: 0.70, heightExpand: 1.10 },
+        author:          { lh: 1.22, gapFactor: 0.50, scaleMin: 0.65, heightExpand: 1.05 },
+        affiliation:     { lh: 1.18, gapFactor: 0.30, scaleMin: 0.60, heightExpand: 1.10 },
+        sidebar:         { lh: 1.30, gapFactor: 0.55, scaleMin: 0.65, heightExpand: 1.05 },
+        abstract:        { lh: 1.50, gapFactor: 0.70, scaleMin: 0.65, heightExpand: 1.35 },
+        keywords:        { lh: 1.30, gapFactor: 0.40, scaleMin: 0.70, heightExpand: 1.10 },
+        "keywords-label":{ lh: 1.20, gapFactor: 0.35, scaleMin: 0.80, heightExpand: 1.00 },
+        header:          { lh: 1.15, gapFactor: 0.25, scaleMin: 0.60, heightExpand: 1.00 },
+        footer:          { lh: 1.15, gapFactor: 0.25, scaleMin: 0.60, heightExpand: 1.00 },
+        body:            { lh: 1.18, gapFactor: 0.42, scaleMin: 0.55, heightExpand: 1.00 },
     };
 
     function wrapText(ctx, text, maxWidth) {
@@ -419,24 +420,80 @@
         return lines;
     }
 
-    // ------- Semantic role classification (cover-page aware) -------
+    // ------- Semantic role classification -------
     //
-    // Detects journal-cover-style structural roles using font size, position,
-    // width, and content patterns. Roles drive both the white-out grouping
-    // and the per-zone spacing config.
-    function classifySemanticRole(paragraphs, canvasW, canvasH) {
-        if (paragraphs.length === 0) return;
+    // Two-tier:
+    //   1. detectPageProfile() examines the page as a whole and decides
+    //      whether to apply the journal-cover layout profile (strict,
+    //      zone-based) or the generic body-page profile.
+    //   2. The chosen classifier tags each paragraph with a role.
+    //
+    // This is what fixes the "all paragraphs treated as one body kind"
+    // problem on academic cover pages.
 
-        var significantFs = paragraphs
-            .filter(function (p) { return p.text.length > 20; })
+    var SIDEBAR_KEYS = /\b(OPEN\s*ACCESS|EDITED\s*BY|REVIEWED\s*BY|RECEIVED|ACCEPTED|PUBLISHED|CITATION|COPYRIGHT|CORRESPONDENCE|TYPE|DOI|BUKA\s*AKSES|DIEDIT\s*OLEH|DITINJAU\s*OLEH|DITERIMA|DISETUJUI|DITERBITKAN|HAK\s*CIPTA|TIPE|KORESPONDENSI|KUTIPAN)\b/i;
+    var ABSTRACT_MARKERS = /^(Abstract|Abstrak|Pendahuluan|Introduction|Background|Latar\s*Belakang|Methods?|Metode|Results?|Hasil|Conclusions?|Kesimpulan|Aim|Tujuan)\s*[:.]/i;
+    var INSTITUTION_WORDS = /\b(University|Universitas|Institut|Institute|Department|Departemen|Research|Hospital|Rumah\s*Sakit|School|Sekolah|Faculty|Fakultas|College|Colegio|Universidad|Université|Università|Centro|Center|Centre|Lab|Laboratory|Laboratorium)\b/i;
+
+    // Detect whether the page should use the journal-cover layout profile.
+    // Signals (require ALL):
+    //   - Has at least one large-font paragraph in top half (title)
+    //   - Has at least 3 narrow paragraphs in left strip (sidebar items)
+    function detectPageProfile(paragraphs, canvasW, canvasH, pageNum) {
+        if (paragraphs.length < 8) return "generic";
+
+        var sigFs = paragraphs
+            .filter(function (p) { return p.text.length > 10; })
             .map(function (p) { return p.fontSize; })
             .sort(function (a, b) { return a - b; });
-        var medianFs = significantFs.length ? significantFs[Math.floor(significantFs.length / 2)] : 12;
+        var medianFs = sigFs.length ? sigFs[Math.floor(sigFs.length / 2)] : 12;
 
-        // Sidebar marker keywords (Frontiers + general academic cover pages, EN/ID/ES/etc)
-        var SIDEBAR_KEYS = /\b(OPEN\s*ACCESS|EDITED\s*BY|REVIEWED\s*BY|RECEIVED|ACCEPTED|PUBLISHED|CITATION|COPYRIGHT|CORRESPONDENCE|TYPE|DOI|BUKA\s*AKSES|DIEDIT\s*OLEH|DITINJAU\s*OLEH|DITERIMA|HAK\s*CIPTA|TIPE|KORESPONDENSI)\b/i;
+        // Big title candidate: font >= 1.5x median, in top 40%
+        var hasLargeTitle = paragraphs.some(function (p) {
+            return p.fontSize >= medianFs * 1.5 && p.bbox.y < canvasH * 0.40
+                && p.bbox.w > canvasW * 0.20;
+        });
 
-        paragraphs.forEach(function (p) {
+        // Narrow left-strip cluster (sidebar)
+        var sidebarCandidates = paragraphs.filter(function (p) {
+            var x2 = p.bbox.x + p.bbox.w;
+            return p.bbox.x < canvasW * 0.05
+                && x2 < canvasW * 0.35
+                && p.bbox.y > canvasH * 0.03
+                && p.bbox.y < canvasH * 0.75;
+        });
+        var hasSidebar = sidebarCandidates.length >= 3;
+
+        // Or detect by content: 2+ paragraphs containing sidebar keywords
+        // anywhere in left half of page
+        var keywordHits = paragraphs.filter(function (p) {
+            return (p.bbox.x + p.bbox.w) < canvasW * 0.50 && SIDEBAR_KEYS.test(p.text);
+        }).length;
+
+        if (hasLargeTitle && (hasSidebar || keywordHits >= 2)) return "journal-cover";
+        return "generic";
+    }
+
+    // -------- Journal-cover classifier (strict, zone-based) --------
+    //
+    // Geometric zones (fractions of canvas):
+    //   header band   y: 0 - 0.06
+    //   footer band   y: 0.94 - 1.0
+    //   sidebar strip x: 0 - 0.34   (full vertical, except header/footer)
+    //   doi block     x: 0.62 - 1.0, y: 0 - 0.18
+    //   main column   x: 0.30 - 1.0  (above abstract zone)
+    //   abstract zone main column, y: 0.28 - 0.92
+    function classifyJournalCover(paragraphs, canvasW, canvasH) {
+        var sorted = paragraphs.slice().sort(function (a, b) { return a.bbox.y - b.bbox.y; });
+        var sigFs = paragraphs
+            .filter(function (p) { return p.text.length > 10; })
+            .map(function (p) { return p.fontSize; })
+            .sort(function (a, b) { return a - b; });
+        var medianFs = sigFs.length ? sigFs[Math.floor(sigFs.length / 2)] : 12;
+        var maxFs = sigFs.length ? sigFs[sigFs.length - 1] : medianFs;
+
+        // First pass: position-based assignment
+        sorted.forEach(function (p) {
             var x = p.bbox.x;
             var x2 = p.bbox.x + p.bbox.w;
             var w = p.bbox.w;
@@ -444,68 +501,89 @@
             var fs = p.fontSize;
             var text = p.text.trim();
 
-            // FOOTER: bottom 5%
+            // FOOTER
             if (yc > canvasH * 0.94) { p.role = "footer"; return; }
-            // HEADER: top 5%
+            // HEADER (decorative top band)
             if (yc < canvasH * 0.06) { p.role = "header"; return; }
 
-            // SIDEBAR (editorial metadata): narrow paragraph in left ~30% of page,
-            // OR in right ~30% near top with editorial markers (DOI block on right side)
-            var isLeftSidebar = x2 < canvasW * 0.30 && w < canvasW * 0.30;
-            var isRightDoiBlock = x > canvasW * 0.65 && yc < canvasH * 0.18 && w < canvasW * 0.35;
-            if ((isLeftSidebar || isRightDoiBlock) && fs < medianFs * 1.4) {
-                p.role = "sidebar";
-                return;
-            }
-            // Sidebar by content keyword (catches multi-line CITATION/COPYRIGHT blocks
-            // that may wrap wider than the narrow column)
-            if (x2 < canvasW * 0.40 && fs < medianFs * 1.1 && SIDEBAR_KEYS.test(text)) {
+            // SIDEBAR by position: paragraph fully in left 34% of page
+            if (x < canvasW * 0.05 && x2 < canvasW * 0.36) {
                 p.role = "sidebar";
                 return;
             }
 
-            // TITLE: large font in top half, reasonably wide
-            if (fs > medianFs * 1.35 && yc < canvasH * 0.50 && w > canvasW * 0.20) {
-                p.role = "title";
+            // SIDEBAR by content (catches wider CITATION/COPYRIGHT wraps)
+            if (x < canvasW * 0.10 && x2 < canvasW * 0.45 && SIDEBAR_KEYS.test(text)) {
+                p.role = "sidebar";
                 return;
             }
 
-            // AUTHOR LIST: medium font in top 40%, comma-separated names
-            // Heuristic: contains commas + capitalized name-like words + not too long
-            var commaCount = (text.match(/,/g) || []).length;
-            var capWords = (text.match(/[A-ZÁ-Úİ][a-zá-úı]{2,}/g) || []).length;
-            var hasNamePattern = commaCount >= 1 && capWords >= 3;
-            if (yc < canvasH * 0.40 && fs >= medianFs * 0.85 && fs <= medianFs * 1.25
-                && hasNamePattern && text.length < 500) {
-                p.role = "author";
+            // DOI block: top-right corner, narrow, multi-line metadata
+            if (x > canvasW * 0.55 && yc < canvasH * 0.18 && w < canvasW * 0.45) {
+                p.role = "sidebar";
                 return;
             }
 
-            // AFFILIATION: smaller font in top half, numbered or institutional words
-            var affilLooks = /^\s*\d+\s*[A-ZÁ-Ú]/.test(text)
-                || /\b(University|Universitas|Institut|Department|Departemen|Research|Hospital|School|Faculty|Fakultas|College|Colegio|Universidad|Université|Università)\b/i.test(text);
-            if (yc < canvasH * 0.55 && fs < medianFs * 0.95 && affilLooks) {
-                p.role = "affiliation";
-                return;
-            }
-
-            // KEYWORDS label
+            // KEYWORDS label (short, lower half, contains keyword marker)
             if (text.length < 40 && /^(KEYWORDS|KATA\s*KUNCI|PALABRAS\s*CLAVE|MOTS-CLÉS)\s*:?\s*$/i.test(text)) {
                 p.role = "keywords-label";
                 return;
             }
 
-            // Default: body (will be column-classified later)
+            // From here, paragraph is in the MAIN column
+            // TITLE: largest font in upper region (0-30%)
+            if (fs >= maxFs * 0.92 && yc < canvasH * 0.32) {
+                p.role = "title";
+                return;
+            }
+
+            // AUTHOR: comma-heavy with name-like capitalization, fs ~= median, top 35%
+            var commaCount = (text.match(/,/g) || []).length;
+            var capWords = (text.match(/[A-ZÁ-Úİ][a-zá-úı]{2,}/g) || []).length;
+            var hasNamePattern = commaCount >= 1 && capWords >= 3;
+            if (yc < canvasH * 0.42 && fs >= medianFs * 0.80 && fs <= medianFs * 1.30
+                && hasNamePattern && text.length < 600) {
+                p.role = "author";
+                return;
+            }
+
+            // AFFILIATION: smaller font, top 50%, numbered or institutional
+            var affilLooks = /^\s*\d+\s*[A-ZÁ-Ú]/.test(text)
+                || INSTITUTION_WORDS.test(text);
+            if (yc < canvasH * 0.52 && fs < medianFs * 1.05 && affilLooks) {
+                p.role = "affiliation";
+                return;
+            }
+
+            // ABSTRACT: contains abstract markers, OR is a large body block
+            // in the lower half of the main column
+            if (ABSTRACT_MARKERS.test(text) && text.length > 100) {
+                p.role = "abstract";
+                return;
+            }
+            if (yc > canvasH * 0.30 && yc < canvasH * 0.92
+                && text.length > 200 && fs < medianFs * 1.2) {
+                p.role = "abstract";
+                return;
+            }
+
+            // Catch-all on cover page: short metadata-like content goes to sidebar
+            // (e.g. correspondence email, copyright wrap that spilled wider)
+            if (text.length < 200 && fs < medianFs * 1.1) {
+                p.role = "sidebar";
+                return;
+            }
+
+            // Fallback (rare on cover page): treat as body
             p.role = "body";
         });
 
-        // Post-pass 1: paragraph immediately after KEYWORDS label → keyword list
-        var sorted = paragraphs.slice().sort(function (a, b) { return a.bbox.y - b.bbox.y; });
+        // Post-pass: paragraph immediately after KEYWORDS label → keyword list
         for (var i = 0; i < sorted.length - 1; i++) {
             if (sorted[i].role === "keywords-label") {
                 for (var j = i + 1; j < sorted.length; j++) {
-                    if (sorted[j].role === "body" &&
-                        Math.abs(sorted[j].bbox.x - sorted[i].bbox.x) < 80) {
+                    if (sorted[j].role !== "header" && sorted[j].role !== "footer"
+                        && Math.abs(sorted[j].bbox.x - sorted[i].bbox.x) < 100) {
                         sorted[j].role = "keywords";
                         break;
                     }
@@ -513,15 +591,51 @@
             }
         }
 
-        // Post-pass 2: detect ABSTRACT — first big body paragraph in top 60% of page
-        // (only relevant on cover pages; other pages will simply have no early big body block)
-        var topBodyCandidates = sorted.filter(function (p) {
-            return p.role === "body"
-                && (p.bbox.y + p.bbox.h / 2) < canvasH * 0.60
-                && p.text.length > 250;
+        // Post-pass: if multiple consecutive 'abstract' candidates, keep the biggest
+        // and demote others to body (avoids dragging paragraphs above abstract into it)
+        var abstracts = sorted.filter(function (p) { return p.role === "abstract"; });
+        if (abstracts.length > 1) {
+            abstracts.sort(function (a, b) { return b.text.length - a.text.length; });
+            for (var k = 1; k < abstracts.length; k++) abstracts[k].role = "body";
+        }
+    }
+
+    // -------- Generic classifier (body pages, simpler heuristics) --------
+    function classifyGeneric(paragraphs, canvasW, canvasH) {
+        var sigFs = paragraphs
+            .filter(function (p) { return p.text.length > 20; })
+            .map(function (p) { return p.fontSize; })
+            .sort(function (a, b) { return a - b; });
+        var medianFs = sigFs.length ? sigFs[Math.floor(sigFs.length / 2)] : 12;
+
+        paragraphs.forEach(function (p) {
+            var yc = p.bbox.y + p.bbox.h / 2;
+            var x2 = p.bbox.x + p.bbox.w;
+            var fs = p.fontSize;
+            var text = p.text.trim();
+
+            if (yc > canvasH * 0.94) { p.role = "footer"; return; }
+            if (yc < canvasH * 0.05) { p.role = "header"; return; }
+
+            // Sidebar still possible on body pages (e.g. running header/sidebar)
+            if (p.bbox.x < canvasW * 0.05 && x2 < canvasW * 0.30 && fs < medianFs * 1.1) {
+                p.role = "sidebar";
+                return;
+            }
+
+            p.role = "body";
         });
-        if (topBodyCandidates.length > 0) {
-            topBodyCandidates[0].role = "abstract";
+    }
+
+    function classifySemanticRole(paragraphs, canvasW, canvasH, pageNum) {
+        if (paragraphs.length === 0) return;
+        var profile = pageNum === 1
+            ? detectPageProfile(paragraphs, canvasW, canvasH, pageNum)
+            : "generic";
+        if (profile === "journal-cover") {
+            classifyJournalCover(paragraphs, canvasW, canvasH);
+        } else {
+            classifyGeneric(paragraphs, canvasW, canvasH);
         }
     }
 
@@ -596,9 +710,9 @@
     //   header, footer) become their own regions, clustered as one zone per
     //   role (with band-splitting for sidebar/header/footer where multiple
     //   distinct items typically exist).
-    function buildRegions(paragraphs, canvasW, canvasH) {
+    function buildRegions(paragraphs, canvasW, canvasH, pageNum) {
         // 1. Semantic role classification (cover-page aware)
-        classifySemanticRole(paragraphs, canvasW, canvasH);
+        classifySemanticRole(paragraphs, canvasW, canvasH, pageNum);
 
         // 2. Group by role
         var byRole = {};
@@ -665,8 +779,10 @@
     // Step 4: reflow + draw a single region using its role-specific spacing
     function reflowAndDraw(ctx, region, canvasH) {
         var colW = region.w;
-        var availH = region.h;
         var sp = region.spacing || SPACING_BY_ROLE.body;
+        // Apply role-specific vertical budget. Abstract gets ~35% extra room
+        // so longer translations don't have to shrink aggressively.
+        var availH = region.h * (sp.heightExpand || 1.0);
 
         // Layout text at a uniform scale; uses ORIGINAL inter-paragraph gaps
         // (scaled) when available so spacing pattern of the source is preserved.
@@ -713,7 +829,7 @@
         ctx.fillStyle = "#111";
         ctx.textBaseline = "top";
         var slack = (region.paragraphs[0] ? region.paragraphs[0].fontSize : 12) * 1.5;
-        var clipBottom = Math.min((region.y + region.h + slack), canvasH - 2);
+        var clipBottom = Math.min((region.y + availH + slack), canvasH - 2);
         ctx.beginPath();
         ctx.rect(region.x - 1, region.y - 1, region.w + 2, clipBottom - region.y + 2);
         ctx.clip();
@@ -756,7 +872,7 @@
         whiteOutOriginalText(ctx, pageData.paragraphs);
 
         // 2. Build column-aware reflow regions
-        var regions = buildRegions(pageData.paragraphs, pageData.canvasW, pageData.canvasH);
+        var regions = buildRegions(pageData.paragraphs, pageData.canvasW, pageData.canvasH, pageData.pageNum);
 
         // 3. Reflow + draw each region
         regions.forEach(function (region) {
