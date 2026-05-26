@@ -231,21 +231,22 @@
             ln.bottom = ln.y + ln.h;
         });
 
-        // Group lines into paragraphs
+        // Group lines into paragraphs (more permissive thresholds for journal text)
         var paragraphs = [];
         var p = null;
         for (var i = 0; i < lines.length; i++) {
             var ln = lines[i];
             if (!p) { p = { lines: [ln] }; paragraphs.push(p); continue; }
             var prev = p.lines[p.lines.length - 1];
-            var sameSize = Math.abs(ln.fontSize - prev.fontSize) / Math.max(prev.fontSize, 1) < 0.25;
-            // Same column: x overlap >= 30% of narrower line
+            var sameSize = Math.abs(ln.fontSize - prev.fontSize) / Math.max(prev.fontSize, 1) < 0.30;
+            // Same column: x overlap >= 25% of narrower line, OR left edges within fontSize*2
             var overlap = Math.min(prev.x2, ln.x2) - Math.max(prev.x, ln.x);
-            var minW = Math.min(prev.x2 - prev.x, ln.x2 - ln.x);
-            var sameCol = overlap >= minW * 0.3;
-            // Close vertically
+            var minW = Math.max(Math.min(prev.x2 - prev.x, ln.x2 - ln.x), 1);
+            var sameCol = overlap >= minW * 0.25 ||
+                          Math.abs(ln.x - prev.x) < prev.fontSize * 2;
+            // Close vertically (allow up to 1.6 * fontSize for paragraphs with leading)
             var gap = ln.y - prev.bottom;
-            var closeY = gap < prev.fontSize * 1.1 && gap >= -2;
+            var closeY = gap < prev.fontSize * 1.6 && gap >= -3;
             if (sameSize && sameCol && closeY) {
                 p.lines.push(ln);
             } else {
@@ -270,6 +271,16 @@
        Render a PDF page → { canvas, paragraphs, ptW, ptH }
     ------------------------------------------------------------------ */
     var RENDER_SCALE = 1.5; // canvas pixels per PDF point. Higher = better quality but more memory.
+    var CMAP_URL = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/cmaps/";
+
+    function loadPdfDocument(arrayBuffer) {
+        return pdfjsLib.getDocument({
+            data: arrayBuffer,
+            cMapUrl: CMAP_URL,
+            cMapPacked: true,
+            useSystemFonts: true,
+        }).promise;
+    }
 
     async function renderPageWithMeta(pdfDoc, pageNum) {
         var page = await pdfDoc.getPage(pageNum);
@@ -279,23 +290,47 @@
         canvas.height = Math.ceil(viewport.height);
         var ctx = canvas.getContext("2d");
 
-        await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+        await page.render({
+            canvasContext: ctx,
+            viewport: viewport,
+            background: "#ffffff",
+        }).promise;
 
-        var content = await page.getTextContent();
+        var content = await page.getTextContent({
+            includeMarkedContent: false,
+            disableNormalization: false,
+        });
+
         var items = content.items
-            .filter(function (it) { return it && it.str && it.str.trim().length; })
+            .filter(function (it) { return it && typeof it.str === "string" && it.str.length; })
             .map(function (it) {
                 var tx = pdfjsLib.Util.transform(viewport.transform, it.transform);
-                var fontHeight = Math.hypot(tx[2], tx[3]);
-                var ascent = fontHeight * 0.85;
+                // Font size in canvas pixels (vertical scale magnitude)
+                var fontHeight = Math.abs(Math.hypot(tx[2], tx[3])) || 10;
+                // Horizontal scale (in case text is non-uniformly scaled)
+                var hScale = Math.abs(Math.hypot(tx[0], tx[1])) || fontHeight;
+                // Width: PDF.js gives item.width in user-space units (pre-transform).
+                // Multiply by horizontal scale to get canvas-space width.
+                var widthCanvas = (typeof it.width === "number" ? it.width : 0) * hScale / Math.max(it.height || 1, 0.0001);
+                if (!isFinite(widthCanvas) || widthCanvas <= 0) {
+                    // Fallback: estimate from string length
+                    widthCanvas = (it.str.length || 1) * fontHeight * 0.5;
+                }
+                var ascent = fontHeight * 0.82;
                 return {
                     str: it.str,
                     x: tx[4],
-                    y: tx[5] - ascent, // top
-                    width: it.width * RENDER_SCALE,
-                    height: fontHeight * 1.1,
+                    y: tx[5] - ascent, // top of text in canvas coords
+                    width: widthCanvas,
+                    height: fontHeight * 1.15, // include descender
                     fontSize: fontHeight,
                 };
+            })
+            .filter(function (it) {
+                return it.fontSize >= 4 && it.fontSize < 200 &&
+                       isFinite(it.x) && isFinite(it.y) &&
+                       it.x >= -50 && it.y >= -50 &&
+                       it.x < canvas.width + 50 && it.y < canvas.height + 50;
             });
 
         var paragraphs = extractParagraphs(items);
@@ -305,6 +340,8 @@
             paragraphs: paragraphs,
             ptW: viewport.width / RENDER_SCALE,
             ptH: viewport.height / RENDER_SCALE,
+            canvasW: canvas.width,
+            canvasH: canvas.height,
         };
     }
 
@@ -445,13 +482,15 @@
         return lines;
     }
 
-    function drawAutoFitText(ctx, text, bbox, originalSize) {
+    function drawAutoFitText(ctx, text, bbox, originalSize, canvasH) {
         ctx.fillStyle = "#111";
         ctx.textBaseline = "top";
 
         var fontFamily = "Georgia, 'Times New Roman', 'Noto Serif', 'Noto Sans', 'Noto Sans CJK SC', 'Noto Sans Arabic', serif";
         var size = originalSize;
-        var minSize = Math.max(originalSize * 0.55, 7);
+        var minSize = Math.max(originalSize * 0.5, 7);
+        // Allow vertical overflow up to 30% beyond bbox (for cases where translated text is much longer)
+        var hardMaxH = Math.min(bbox.h * 1.4, (canvasH || (bbox.y + bbox.h * 1.4)) - bbox.y - 4);
 
         function tryFit(s) {
             ctx.font = s + "px " + fontFamily;
@@ -461,34 +500,46 @@
         }
 
         var fit = tryFit(size);
-        while (fit.totalH > bbox.h * 1.08 && size > minSize) {
+        // Shrink while text doesn't fit even in the expanded budget
+        while (fit.totalH > hardMaxH && size > minSize) {
             size = Math.max(minSize, size - 0.5);
             fit = tryFit(size);
         }
 
+        // Clip drawing region so text never spills far past bbox
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(bbox.x - 1, bbox.y - 1, bbox.w + 2, hardMaxH + 2);
+        ctx.clip();
+
         var y = bbox.y;
         for (var i = 0; i < fit.lines.length; i++) {
-            // Stop if we'd overflow significantly
-            if (y - bbox.y > bbox.h + size * 1.5) break;
             ctx.fillText(fit.lines[i], bbox.x, y);
             y += fit.lh;
         }
+        ctx.restore();
     }
 
     function applyTranslationsToCanvas(pageData) {
         var ctx = pageData.canvas.getContext("2d");
-        // White-out all paragraph bboxes first (so neighboring overlap doesn't reveal old text)
+        // White-out all paragraph bboxes first (so neighboring overlap doesn't reveal old text).
+        // Use generous padding to fully cover any anti-aliased pixels of the original text.
         ctx.save();
         ctx.fillStyle = "#ffffff";
         pageData.paragraphs.forEach(function (p) {
-            var pad = 2;
-            ctx.fillRect(p.bbox.x - pad, p.bbox.y - pad, p.bbox.w + pad * 2, p.bbox.h + pad * 2);
+            var pad = Math.max(3, p.fontSize * 0.15);
+            ctx.fillRect(
+                p.bbox.x - pad,
+                p.bbox.y - pad,
+                p.bbox.w + pad * 2,
+                p.bbox.h + pad * 2
+            );
         });
         ctx.restore();
         // Draw translated text
         pageData.paragraphs.forEach(function (p) {
             if (!p.translatedText) return;
-            drawAutoFitText(ctx, p.translatedText, p.bbox, p.fontSize);
+            drawAutoFitText(ctx, p.translatedText, p.bbox, p.fontSize, pageData.canvasH);
         });
     }
 
@@ -520,7 +571,7 @@
             var totalPages = 0;
             for (var fi = 0; fi < state.files.length; fi++) {
                 var ab = await state.files[fi].arrayBuffer();
-                var d = await pdfjsLib.getDocument({ data: ab }).promise;
+                var d = await loadPdfDocument(ab);
                 docs.push({ doc: d, name: state.files[fi].name });
                 totalPages += d.numPages;
             }
