@@ -458,3 +458,20 @@ button { font-family: inherit; cursor: pointer; border: none; }
 
 /* ----------- UTILITIES ------------ */
 .hidden { display: none !important; }
+
+
+/* ----------- RESULT HINT (PDF print pipeline) ----------- */
+.result__hint {
+    margin-top: 18px;
+    font-size: 13px;
+    color: var(--text-muted);
+    max-width: 520px;
+    margin-left: auto;
+    margin-right: auto;
+    line-height: 1.5;
+    background: #fafbfd;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+}
+.result__hint strong { color: var(--text); }

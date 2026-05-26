@@ -7,11 +7,10 @@
     <meta name="description" content="Terjemahkan dokumen PDF secara online dan gratis. Cepat, akurat, dan mendukung banyak bahasa. Tanpa upload ke server." />
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect width='24' height='24' rx='4' fill='%23E5322D'/><text x='12' y='16' font-family='Arial' font-size='10' font-weight='bold' fill='white' text-anchor='middle'>PDF</text></svg>" />
     <link rel="stylesheet" href="assets/css/styles.css" />
+    <link rel="stylesheet" href="assets/css/print.css" media="print" />
 
-    <!-- PDF.js -->
+    <!-- PDF.js (extraction). Loaded before the module so window.pdfjsLib exists. -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.js"></script>
-    <!-- jsPDF for output -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 </head>
 <body class="lang-id toolpage">
     <header class="topbar">
@@ -138,8 +137,14 @@
                     Unduh PDF terjemahan
                     <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                 </button>
-                <button id="btnPreview" class="actionbar__ghost" type="button">Lihat pratinjau teks</button>
+                <button id="btnPreview" class="actionbar__ghost" type="button">Pratinjau dokumen</button>
                 <button id="btnRestart" class="actionbar__ghost" type="button">Terjemahkan PDF lain</button>
+
+                <p class="result__hint">
+                    Tombol "Unduh" akan membuka dialog cetak browser. Pilih
+                    <strong>"Save as PDF"</strong> sebagai tujuan untuk mendapatkan PDF
+                    A4 vektor dengan teks yang bisa diseleksi (bukan gambar).
+                </p>
 
                 <div id="preview" class="preview hidden">
                     <div class="preview__col">
@@ -206,9 +211,9 @@
     </main>
 
     <footer class="footer">
-        <p>&copy; <span id="year"></span> PDF Translate &middot; Dibuat dengan PDF.js, jsPDF &amp; Google Translate.</p>
+        <p>&copy; <span id="year"></span> PDF Translate &middot; Dibuat dengan PDF.js &amp; print-to-PDF browser. Renderer Puppeteer opsional di /server.</p>
     </footer>
 
-    <script src="assets/js/app.js"></script>
+    <script type="module" src="assets/js/app.js"></script>
 </body>
 </html>
